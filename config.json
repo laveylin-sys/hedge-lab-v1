@@ -1,7 +1,12 @@
 {
   "starting_capital": 10000.0,
-  "symbols": ["BTC"],
-  "intervals": ["5m", "15m"],
+  "symbols": [
+    "BTC"
+  ],
+  "intervals": [
+    "5m",
+    "15m"
+  ],
   "pair_size_usd": 100.0,
   "max_unhedged_usd": 300.0,
   "max_total_exposure_usd": 2000.0,
@@ -10,5 +15,9 @@
   "hedge_timeout_sec": 12.0,
   "stale_book_sec": 5.0,
   "paper_fill_model": "trade_through",
-  "db_path": "hedge_lab_v1.sqlite3"
+  "db_path": "hedge_lab_v1.sqlite3",
+  "market_refresh_sec": 20.0,
+  "force_hedge_before_end_sec": 20.0,
+  "timeout_edge_relaxation": 0.03,
+  "expiry_hedge_max_price": 0.99
 }

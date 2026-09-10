@@ -306,8 +306,35 @@ class Engine:
         self.token_map[m.up_token] = (m.id, "UP")
         self.token_map[m.down_token] = (m.id, "DOWN")
 
+    def tradable_token_ids(self) -> list[str]:
+        now = time.time()
+        return [t for m in self.markets.values() if m.end_ts > now
+                for t in (m.up_token, m.down_token)]
+
+    def active_market_ids(self) -> set[str]:
+        now = time.time()
+        return {m.id for m in self.markets.values() if m.end_ts > now}
+
+    def prune_quotes(self):
+        active = self.active_market_ids()
+        for mid in list(self.pending_quotes):
+            if mid not in active:
+                self.pending_quotes.pop(mid, None)
+
     def exposure(self) -> float:
-        return sum(p.first.price*p.first.qty for p in self.pairs.values() if not p.complete)
+        # Only live, incomplete pairs count as current hedgeable exposure.
+        now = time.time()
+        return sum(p.first.price*p.first.qty for p in self.pairs.values()
+                   if not p.complete and self.markets.get(p.market_id)
+                   and self.markets[p.market_id].end_ts > now)
+
+    def gross_inventory_cost(self) -> float:
+        total = 0.0
+        for p in self.pairs.values():
+            total += p.first.price * p.first.qty
+            if p.second is not None:
+                total += p.second.price * p.second.qty
+        return total
 
     def completed(self) -> int:
         return sum(1 for p in self.pairs.values() if p.complete)
@@ -399,9 +426,18 @@ class Engine:
             # Include taker fee in the final decision below; price cap is only a fast pre-filter.
             max_hedge = 1.0 - p.first.price - float(self.cfg["min_locked_edge"])
             age_s = (t - p.first.ts_ms)/1000
-            emergency = age_s >= float(self.cfg["hedge_timeout_sec"])
-            # Normal hedge requires locked edge. Emergency hedge may accept a small loss to cap exposure.
-            cap = max_hedge if not emergency else min(0.999, max_hedge + 0.015)
+            time_left_s = market.end_ts - time.time()
+            timeout = age_s >= float(self.cfg["hedge_timeout_sec"])
+            expiry_emergency = time_left_s <= float(self.cfg.get("force_hedge_before_end_sec", 20.0))
+            emergency = timeout or expiry_emergency
+            # Normal hedge requires locked edge. Timeout can accept a bounded loss; near expiry
+            # we cross any valid ask to avoid carrying a naked leg into a closed market.
+            if expiry_emergency:
+                cap = float(self.cfg.get("expiry_hedge_max_price", 0.99))
+            elif timeout:
+                cap = min(0.999, max_hedge + float(self.cfg.get("timeout_edge_relaxation", 0.03)))
+            else:
+                cap = max_hedge
             if b.ask is not None and b.ask <= cap:
                 q = p.first.qty
                 fee1 = self.taker_fee(market, q, p.first.price, p.first.liquidity)
@@ -410,11 +446,14 @@ class Engine:
                 min_edge_dollars = q*float(self.cfg["min_locked_edge"])
                 if net_edge >= min_edge_dollars or emergency:
                     usd = q * b.ask
-                    self._buy(market, other_outcome, b.ask, usd, "TAKER", "hedge_complete" if not emergency else "timeout_hedge", p)
+                    reason = "expiry_hedge" if expiry_emergency else ("timeout_hedge" if timeout else "hedge_complete")
+                    self._buy(market, other_outcome, b.ask, usd, "TAKER", reason, p)
                     self.last_action_ms[market.id] = t
                     return
 
         if self.exposure() >= float(self.cfg["max_unhedged_usd"]):
+            return
+        if self.gross_inventory_cost() >= float(self.cfg.get("max_total_exposure_usd", 2000.0)):
             return
 
         # 2) Atomic pair opportunity at displayed asks. This is the cleanest baseline edge.
@@ -502,28 +541,62 @@ class Engine:
 async def run_live(cfg: dict[str, Any]):
     db = DB(cfg["db_path"], float(cfg["starting_capital"]))
     disc = Discovery(); engine = Engine(cfg, db)
-    markets = disc.active_btc()
-    if not markets:
-        raise RuntimeError("No active BTC 5m/15m markets discovered from Gamma API")
-    for m in markets:
-        engine.install_market(m, disc.get_books(m))
-        print(f"TRACK {m.interval}: {m.question} | {m.slug}")
-    tokens = [t for m in markets for t in (m.up_token, m.down_token)]
-    print("HEDGE-LAB V1 | PAPER ONLY | starting capital $10,000")
-    print(engine.status())
+
+    async def refresh_markets(initial: bool = False) -> bool:
+        changed = False
+        markets = await asyncio.to_thread(disc.active_btc)
+        if not markets and initial:
+            raise RuntimeError("No active BTC 5m/15m markets discovered from Gamma API")
+        for m in markets:
+            old = engine.markets.get(m.id)
+            if old is None:
+                books = await asyncio.to_thread(disc.get_books, m)
+                engine.install_market(m, books)
+                print(f"TRACK {m.interval}: {m.question} | {m.slug}", flush=True)
+                changed = True
+        engine.prune_quotes()
+        return changed
+
+    await refresh_markets(initial=True)
+    print("HEDGE-LAB V1.2 | PAPER ONLY | starting capital $10,000", flush=True)
+    print(engine.status(), flush=True)
+
+    reconnect = asyncio.Event()
 
     async def reporter():
         while True:
             await asyncio.sleep(5)
             print(datetime.now().strftime("%H:%M:%S"), engine.status(), flush=True)
 
+    async def market_refresher():
+        # BTC 5m/15m contracts roll continuously. Refresh discovery and force WS re-subscription
+        # when a new time bucket appears.
+        while True:
+            await asyncio.sleep(float(cfg.get("market_refresh_sec", 20.0)))
+            try:
+                if await refresh_markets():
+                    reconnect.set()
+            except Exception as e:
+                print(f"MARKET refresh: {type(e).__name__}: {e}", flush=True)
+
     async def ws_loop():
         while True:
+            tokens = engine.tradable_token_ids()
+            if not tokens:
+                try:
+                    await refresh_markets(initial=True)
+                except Exception as e:
+                    print(f"DISCOVERY retry: {type(e).__name__}: {e}", flush=True)
+                    await asyncio.sleep(2)
+                    continue
+                tokens = engine.tradable_token_ids()
+            reconnect.clear()
             try:
                 async with websockets.connect(MARKET_WS, ping_interval=None, close_timeout=5) as ws:
                     await ws.send(json.dumps({"assets_ids": tokens, "type": "market"}))
+                    print(f"WS subscribed: {len(tokens)} tokens", flush=True)
                     last_ping = time.monotonic()
-                    while True:
+                    while not reconnect.is_set():
                         timeout = max(0.1, 10 - (time.monotonic() - last_ping))
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
@@ -532,14 +605,17 @@ async def run_live(cfg: dict[str, Any]):
                             msg = json.loads(raw)
                             if isinstance(msg, list):
                                 for e in msg: engine.on_event(e)
-                            elif isinstance(msg, dict): engine.on_event(msg)
+                            elif isinstance(msg, dict):
+                                engine.on_event(msg)
                         except asyncio.TimeoutError:
                             await ws.send("PING"); last_ping = time.monotonic()
+                if reconnect.is_set():
+                    print("WS resubscribe: market rollover", flush=True)
             except Exception as e:
                 print(f"WS reconnect: {type(e).__name__}: {e}", flush=True)
                 await asyncio.sleep(2)
 
-    await asyncio.gather(ws_loop(), reporter())
+    await asyncio.gather(ws_loop(), reporter(), market_refresher())
 
 
 def report(db_path: str):
