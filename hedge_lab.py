@@ -176,63 +176,93 @@ class Discovery:
     def __init__(self):
         self.s = requests.Session()
 
-    def active_btc(self) -> list[Market]:
-        # Gamma's public list endpoint changes ordering over time. Pull a broad active slice,
-        # then identify current BTC Up/Down markets by slug/question and token metadata.
-        r = self.s.get(f"{GAMMA}/markets", params={"active": "true", "closed": "false", "limit": 500}, timeout=20)
+    def _event_by_slug(self, slug: str) -> dict[str, Any] | None:
+        r = self.s.get(f"{GAMMA}/events", params={"slug": slug}, timeout=20)
         r.raise_for_status()
-        out: list[Market] = []
-        now = time.time()
-        for m in r.json():
-            slug = str(m.get("slug") or "")
-            q = str(m.get("question") or "")
-            low = (slug + " " + q).lower()
-            if "btc" not in low and "bitcoin" not in low:
-                continue
-            interval = "5m" if "5m" in low or "5 min" in low or "5-minute" in low else (
-                "15m" if "15m" in low or "15 min" in low or "15-minute" in low else "")
-            if not interval or ("up" not in low or "down" not in low):
-                continue
-            tids = parse_jsonish(m.get("clobTokenIds") or m.get("clob_token_ids") or [])
-            outcomes = parse_jsonish(m.get("outcomes") or [])
-            if not isinstance(tids, list) or len(tids) != 2 or not isinstance(outcomes, list) or len(outcomes) != 2:
-                continue
-            mapping = {str(o).lower(): str(t) for o, t in zip(outcomes, tids)}
-            up = mapping.get("up") or mapping.get("yes")
-            down = mapping.get("down") or mapping.get("no")
-            if not up or not down:
-                continue
-            end_raw = m.get("endDate") or m.get("end_date")
+        data = r.json()
+        return data[0] if isinstance(data, list) and data else None
+
+    def _market_from_event(self, event: dict[str, Any], interval: str, now: float) -> Market | None:
+        markets = event.get("markets") or []
+        if not markets:
+            return None
+        # Each BTC Up/Down event is binary; take the active/orderbook-enabled child market.
+        m = next((x for x in markets if x.get("enableOrderBook", True) and not x.get("closed", False)), markets[0])
+        slug = str(event.get("slug") or m.get("slug") or "")
+        q = str(m.get("question") or event.get("title") or event.get("question") or slug)
+        tids = parse_jsonish(m.get("clobTokenIds") or m.get("clob_token_ids") or [])
+        outcomes = parse_jsonish(m.get("outcomes") or [])
+        if not isinstance(tids, list) or len(tids) != 2 or not isinstance(outcomes, list) or len(outcomes) != 2:
+            return None
+        mapping = {str(o).lower(): str(t) for o, t in zip(outcomes, tids)}
+        up = mapping.get("up") or mapping.get("yes")
+        down = mapping.get("down") or mapping.get("no")
+        if not up or not down:
+            return None
+
+        end_raw = m.get("endDate") or event.get("endDate") or m.get("end_date")
+        try:
+            end_ts = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            # Slug timestamp is the window start for these markets.
             try:
-                end_ts = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).timestamp()
+                start_ts = int(slug.rsplit("-", 1)[1])
+                end_ts = start_ts + (300 if interval == "5m" else 900)
             except Exception:
                 end_ts = now + (300 if interval == "5m" else 900)
-            if end_ts < now - 30:
-                continue
-            condition_id = str(m.get("conditionId") or "")
-            tick = float(m.get("orderPriceMinTickSize") or 0.01)
-            fee_rate = 0.07
-            if condition_id:
+        if end_ts <= now:
+            return None
+
+        condition_id = str(m.get("conditionId") or m.get("condition_id") or "")
+        tick = float(m.get("orderPriceMinTickSize") or 0.01)
+        fee_rate = 0.07
+        # Fee metadata can vary by API generation; failure here must never block discovery.
+        if condition_id:
+            for path in (f"{CLOB}/markets/{condition_id}", f"{CLOB}/clob-markets/{condition_id}"):
                 try:
-                    info = self.s.get(f"{CLOB}/clob-markets/{condition_id}", timeout=10).json()
-                    tick = float(info.get("mts") or tick)
-                    fd = info.get("fd") or {}
-                    if fd.get("r") is not None:
-                        fee_rate = float(fd["r"])
+                    rr = self.s.get(path, timeout=8)
+                    if not rr.ok:
+                        continue
+                    info = rr.json()
+                    tick = float(info.get("minimum_tick_size") or info.get("min_tick_size") or info.get("mts") or tick)
+                    fd = info.get("fee") or info.get("fd") or {}
+                    if isinstance(fd, dict):
+                        val = fd.get("rate") if fd.get("rate") is not None else fd.get("r")
+                        if val is not None:
+                            fee_rate = float(val)
+                    break
                 except Exception:
                     pass
-            out.append(Market(
-                id=str(m.get("id") or m.get("conditionId") or slug),
-                condition_id=condition_id, slug=slug, question=q,
-                interval=interval, end_ts=end_ts, up_token=up, down_token=down,
-                tick_size=tick, taker_fee_rate=fee_rate,
-            ))
-        out.sort(key=lambda x: x.end_ts)
-        # One nearest-expiry live market per interval is enough for baseline V1.
-        picked: dict[str, Market] = {}
-        for m in out:
-            picked.setdefault(m.interval, m)
-        return list(picked.values())
+
+        return Market(
+            id=str(m.get("id") or condition_id or slug),
+            condition_id=condition_id, slug=slug, question=q, interval=interval,
+            end_ts=end_ts, up_token=up, down_token=down, tick_size=tick, taker_fee_rate=fee_rate,
+        )
+
+    def active_btc(self) -> list[Market]:
+        # BTC short-window events are hidden from Gamma's generic /markets listing.
+        # Resolve the exact live time bucket by canonical slug instead.
+        now = time.time()
+        specs = (("5m", 300, "btc-updown-5m"), ("15m", 900, "btc-updown-15m"))
+        out: list[Market] = []
+        for interval, seconds, prefix in specs:
+            bucket = int(now) - (int(now) % seconds)
+            # Current bucket first; adjacent buckets tolerate clock/listing boundary races.
+            for ts in (bucket, bucket - seconds, bucket + seconds):
+                slug = f"{prefix}-{ts}"
+                try:
+                    event = self._event_by_slug(slug)
+                except Exception as e:
+                    print(f"DISCOVERY {interval} {slug}: {type(e).__name__}: {e}", flush=True)
+                    continue
+                if not event:
+                    continue
+                market = self._market_from_event(event, interval, now)
+                if market is not None:
+                    out.append(market)
+                    break
+        return out
 
     def get_books(self, market: Market) -> dict[str, Book]:
         r = self.s.post(f"{CLOB}/books", json=[{"token_id": market.up_token}, {"token_id": market.down_token}], timeout=10)
@@ -254,7 +284,6 @@ class Discovery:
                 updated_ms=now_ms(),
             )
         return books
-
 
 class Engine:
     def __init__(self, cfg: dict[str, Any], db: DB):
