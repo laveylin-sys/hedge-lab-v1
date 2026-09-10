@@ -5,14 +5,15 @@ Independent Polymarket BTC 5m/15m hedge / market-making paper-trading baseline.
 ## Hard constraints
 - Starting virtual capital: **US$10,000**
 - **Paper only**: no private key, API key, order signing, or live order endpoint
-- Independent from Directional V4: separate process and SQLite state
+- Independent from Directional V4: separate process and state
 - Live metrics: Equity, P&L, trade log, Pair Completion Rate, Time-to-Hedge, unhedged exposure, Max Drawdown
 
 ## Data path
 1. Gamma REST discovers current BTC Up/Down 5m/15m markets and token IDs.
 2. CLOB `/books` seeds both outcome order books.
 3. Public Market WebSocket streams `book`, `price_change`, and `last_trade_price` events.
-4. SQLite stores trades, pairs, and equity snapshots.
+4. `hedge_lab.py` uses SQLite for the original local baseline.
+5. `persistent_hedge_lab.py` uses PostgreSQL when Render provides `DATABASE_URL`, and restores engine state after worker restarts.
 
 ## Baseline execution logic
 1. **Hedge-first:** incomplete pairs are always evaluated before opening new inventory.
@@ -23,7 +24,7 @@ Independent Polymarket BTC 5m/15m hedge / market-making paper-trading baseline.
 
 This intentionally prioritizes honest baseline measurement over flattering paper P&L.
 
-## Run
+## Run original SQLite mode
 ```bash
 python -m venv .venv
 # Windows: .venv\\Scripts\\activate
@@ -32,10 +33,28 @@ pip install -r requirements.txt
 python hedge_lab.py run
 ```
 
-Get current summary:
+Get current SQLite summary:
 ```bash
 python hedge_lab.py report
 ```
+
+## Run persistent PostgreSQL mode
+Set `DATABASE_URL` in the environment, then run:
+```bash
+python persistent_hedge_lab.py run
+```
+
+Get the persistent PostgreSQL summary:
+```bash
+python persistent_hedge_lab.py report
+```
+
+On Render, after `DATABASE_URL` is linked to the Background Worker, change the Start Command to:
+```bash
+python persistent_hedge_lab.py
+```
+
+**Important:** the first PostgreSQL activation starts a new persistent US$10,000 measurement baseline. The prior ephemeral SQLite run is not automatically migrated.
 
 ## Key config
 - `pair_size_usd`: target dollars for first leg

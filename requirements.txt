@@ -1,2 +1,3 @@
 requests>=2.31,<3
 websockets>=13,<16
+psycopg[binary]>=3.2,<4
